@@ -53,56 +53,178 @@ def clip_video(input_video_path, start_time, end_time, output_path):
     except subprocess.CalledProcessError as e: return False, e.stderr
 
 def analyze_clip_for_crop(clip_path, progress_bar):
-    """Step 2: Analyzes the clip with OpenCV to find the best stable crop, but does NOT write video."""
+    """
+    Step 2: Analyzes the clip using "Segmented Reframing" to create a smooth, dynamic camera path.
+    Returns a list of integer x-coordinates, one for each frame.
+    """
     cap = cv2.VideoCapture(str(clip_path))
-    if not cap.isOpened(): return None, None
+    if not cap.isOpened():
+        return None, None
 
+    # Video properties
     frame_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     frame_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-    face_centers = []
+    fps = cap.get(cv2.CAP_PROP_FPS)
 
+    # --- Configuration for "Segmented Reframing" ---
+    SEGMENT_DURATION_SECONDS = 3
+    FRAMES_PER_SEGMENT = int(SEGMENT_DURATION_SECONDS * fps)
+    MOVE_THRESHOLD = frame_width * 0.08  # Move if target is > 8% of frame width away
+    TRANSITION_DURATION_FRAMES = int(0.5 * fps) # 0.5-second smooth transition
+    FACE_SAMPLE_RATE = 5 # Sample faces every 5 frames within a segment
+
+    # --- Analysis ---
+    segment_medians = []
     with mp.solutions.face_detection.FaceDetection(model_selection=0, min_detection_confidence=0.5) as detector:
-        for frame_num in range(total_frames):
-            ret, frame = cap.read()
-            if not ret: break
-            # Sample every 10 frames for efficiency and stability
-            if frame_num % 10 == 0:
-                center = get_face_center(frame, detector)
-                if center: face_centers.append(center)
-            progress_bar.progress(frame_num / total_frames)
+        for start_frame in range(0, total_frames, FRAMES_PER_SEGMENT):
+            end_frame = min(start_frame + FRAMES_PER_SEGMENT, total_frames)
+            segment_centers = []
+
+            # Set video capture to the start of the segment
+            cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
+
+            for frame_num in range(start_frame, end_frame):
+                ret, frame = cap.read()
+                if not ret:
+                    break
+
+                # Sample faces at a specific rate for efficiency
+                if frame_num % FACE_SAMPLE_RATE == 0:
+                    center = get_face_center(frame, detector)
+                    if center:
+                        segment_centers.append(center)
+                
+                # Update progress bar based on overall progress
+                progress_bar.progress(frame_num / total_frames, text="Step 2/3: Analyzing clip...")
+
+
+            if segment_centers:
+                # Use median for robustness against outliers
+                median_center = int(np.median(segment_centers))
+                segment_medians.append(median_center)
+            else:
+                # If no face found, use the previous segment's median or default to center
+                last_median = segment_medians[-1] if segment_medians else frame_width // 2
+                segment_medians.append(last_median)
 
     cap.release()
-    
-    if not face_centers:
-        # If no faces found, default to the center of the frame.
-        return frame_width // 2, frame_height
-    
-    # Return the average face position for a stable crop.
-    return int(np.mean(face_centers)), frame_height
 
-def apply_ffmpeg_crop(input_clip_path, output_path, crop_center_x, frame_height):
-    """Step 3: Uses FFmpeg to apply the calculated crop, scale, and copy audio for perfect sync."""
+    if not segment_medians:
+        # If no faces were ever found, create a static crop centered in the frame
+        return [frame_width // 2] * total_frames, frame_height
+
+    # --- Generate Smoothed Camera Path ---
+    camera_path = []
+    current_center = segment_medians[0] # Start with the first segment's median
+    camera_path.extend([current_center] * FRAMES_PER_SEGMENT) # Fill the first segment
+
+    for i in range(1, len(segment_medians)):
+        target_center = segment_medians[i]
+        
+        # Decide if camera should move
+        if abs(target_center - current_center) > MOVE_THRESHOLD:
+            # Smooth transition
+            transition_points = np.linspace(current_center, target_center, TRANSITION_DURATION_FRAMES)
+            
+            # Fill frames before transition
+            frames_before_transition = FRAMES_PER_SEGMENT - TRANSITION_DURATION_FRAMES
+            if frames_before_transition > 0:
+                camera_path.extend([current_center] * frames_before_transition)
+
+            # Add the transition frames
+            camera_path.extend(transition_points.astype(int))
+            current_center = target_center # Update camera position
+        else:
+            # No movement, hold the current position
+            camera_path.extend([current_center] * FRAMES_PER_SEGMENT)
+
+    # Ensure camera_path has the correct number of frames, trimming or padding if necessary
+    camera_path = camera_path[:total_frames]
+    while len(camera_path) < total_frames:
+        camera_path.append(camera_path[-1])
+        
+    return camera_path, frame_height
+
+def apply_dynamic_crop_and_save(input_clip_path, output_path, camera_path, frame_height, progress_bar):
+    """
+    Step 3: Reads the clip frame-by-frame, applies the dynamic crop from the camera_path,
+    and saves the result. Finally, it merges the audio from the original clip.
+    """
+    cap = cv2.VideoCapture(str(input_clip_path))
+    if not cap.isOpened():
+        return False, "Could not open input clip for cropping."
+
+    frame_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    fps = cap.get(cv2.CAP_PROP_FPS)
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+
+    # Path for the temporary video file (no audio)
+    temp_video_path = input_clip_path.with_suffix('.temp.mp4')
+    
+    # Define the codec and create VideoWriter object
+    fourcc = cv2.VideoWriter_fourcc(*'mp4v') # Or 'avc1'
+    out = cv2.VideoWriter(str(temp_video_path), fourcc, fps, OUTPUT_RESOLUTION)
+
+    if not out.isOpened():
+        cap.release()
+        return False, "Could not open VideoWriter for temporary file."
+
     crop_width = int(frame_height * TARGET_RATIO)
-    x_coord = max(0, crop_center_x - crop_width // 2)
 
-    # Ensure the crop coordinates are integers
-    crop_width = int(crop_width)
-    x_coord = int(x_coord)
+    # Process each frame
+    for frame_num in range(total_frames):
+        ret, frame = cap.read()
+        if not ret:
+            break
 
-    video_filter = f"crop={crop_width}:{frame_height}:{x_coord}:0,scale={OUTPUT_RESOLUTION[0]}:{OUTPUT_RESOLUTION[1]}"
+        # Get the target center for this frame from the pre-computed camera path
+        center_x = camera_path[frame_num]
+        
+        # Calculate crop coordinates
+        x1 = max(0, center_x - crop_width // 2)
+        x2 = min(frame_width, x1 + crop_width)
+        
+        # Adjust x1 if crop goes out of bounds
+        if x2 - x1 < crop_width:
+            x1 = x2 - crop_width
 
+        # Perform the crop
+        cropped_frame = frame[:, int(x1):int(x2)]
+
+        # Resize to the final output resolution
+        resized_frame = cv2.resize(cropped_frame, OUTPUT_RESOLUTION, interpolation=cv2.INTER_AREA)
+
+        out.write(resized_frame)
+        progress_bar.progress(frame_num / total_frames, text="Step 3/3: Applying crop and finalizing video...")
+
+    # Release resources
+    cap.release()
+    out.release()
+    
+    # --- Step 4: Merge audio from original clip using FFmpeg ---
     cmd = [
-        FFMPEG_PATH, "-y", "-i", str(input_clip_path),
-        "-vf", video_filter,
-        "-c:v", "libx264", "-preset", "medium", "-crf", "23",
-        "-c:a", "copy", # CRITICAL: Copy audio stream without re-encoding
+        FFMPEG_PATH, "-y",
+        "-i", str(temp_video_path),  # Video from OpenCV
+        "-i", str(input_clip_path),  # Audio from original clip
+        "-c:v", "copy",              # Copy the already encoded video stream
+        "-c:a", "aac",               # Re-encode audio to a standard format (or use "copy")
+        "-map", "0:v:0",             # Map video from the first input
+        "-map", "1:a:0",             # Map audio from the second input
+        "-shortest",                 # Finish encoding when the shortest stream ends
         str(output_path)
     ]
     try:
         subprocess.run(cmd, check=True, capture_output=True, text=True)
+        # Clean up the temporary video file
+        if temp_video_path.exists():
+            temp_video_path.unlink()
         return True, ""
-    except subprocess.CalledProcessError as e: return False, e.stderr
+    except subprocess.CalledProcessError as e:
+        # Clean up on failure as well
+        if temp_video_path.exists():
+            temp_video_path.unlink()
+        return False, f"FFmpeg audio merge failed: {e.stderr}"
 
 # --- Streamlit UI ---
 st.set_page_config(layout="wide")
@@ -138,28 +260,32 @@ if uploaded_video and uploaded_csv:
                 st.subheader(f"Processing Clip {index + 1}/{len(df)}: {start_time} - {end_time}")
                 
                 # STEP 1: Clip with perfect audio
-                with st.spinner(f"Step 1/2: Clipping segment..."):
+                with st.spinner(f"Step 1/3: Clipping segment..."):
                     success, msg = clip_video(video_path, start_time, end_time, raw_clip_path)
                     if not success: st.error(f"Failed Step 1 (Clip):"); st.code(msg); continue
-                    st.success("Step 1/2: Clipping successful.")
+                    st.success("Step 1/3: Clipping successful.")
 
-                # STEP 2 & 3: Analyze and then Crop with FFmpeg
+                # STEP 2 & 3: Analyze and then Crop
                 if raw_clip_path.exists():
-                    progress_bar = st.progress(0)
-                    with st.spinner(f"Step 2/2: Analyzing for stable crop & finalizing video..."):
-                        # Analyze to get crop coordinates
-                        crop_center, frame_h = analyze_clip_for_crop(raw_clip_path, progress_bar)
-                        if crop_center is None:
-                            st.warning(f"Could not analyze clip {index}. Skipping.")
-                            continue
-                        
-                        # Apply crop using FFmpeg for perfect audio sync
-                        success, msg = apply_ffmpeg_crop(raw_clip_path, final_video_path, crop_center, frame_h)
-                        if success:
-                            st.success("Step 2/2: Analysis and finalization complete!")
-                            final_video_paths.append(final_video_path)
-                        else:
-                            st.error(f"Failed Step 2 (Crop/Finalize):"); st.code(msg)
+                    # Create a single progress bar for the next two steps
+                    progress_bar = st.progress(0, text="Starting analysis...")
+                    
+                    # STEP 2: Analyze for dynamic crop
+                    camera_path, frame_h = analyze_clip_for_crop(raw_clip_path, progress_bar)
+                    if camera_path is None:
+                        st.warning(f"Could not analyze clip {index}. Skipping.")
+                        progress_bar.empty()
+                        continue
+                    st.success("Step 2/3: Clip analysis complete.")
+                    
+                    # STEP 3: Apply dynamic crop and save
+                    success, msg = apply_dynamic_crop_and_save(raw_clip_path, final_video_path, camera_path, frame_h, progress_bar)
+                    if success:
+                        st.success("Step 3/3: Dynamic crop applied and video finalized!")
+                        final_video_paths.append(final_video_path)
+                    else:
+                        st.error(f"Failed Step 3 (Crop/Finalize):"); st.code(msg)
+                    
                     progress_bar.empty() # Clean up progress bar
                 else: st.error(f"Raw clip for row {index} not found after clipping.")
                 st.markdown("---")
